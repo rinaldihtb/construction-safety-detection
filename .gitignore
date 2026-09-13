@@ -1,6 +1,7 @@
 *.sample
 .*
 model/datasets/
+__pycache__/
 !.gitignore
 !.env.example
 *.sh
