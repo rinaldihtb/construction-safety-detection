@@ -1,0 +1,6 @@
+*.sample
+.*
+model/datasets/
+!.gitignore
+!.env.example
+*.sh
