@@ -30,6 +30,164 @@ sample_images = sorted(
     ]
 )
 
+PPE_LABELS = {"helmet", "no-helmet", "vest", "no-vest"}
+
+
+def get_box_center(box):
+    """Mengambil titik tengah dari sebuah kotak deteksi."""
+    left, top, right, bottom = box
+    return (left + right) / 2, (top + bottom) / 2
+
+
+def find_person_for_ppe(ppe_box, people):
+    """Mencari person yang paling dekat dan memuat posisi APD."""
+    ppe_center_x, ppe_center_y = get_box_center(ppe_box)
+    matching_people = []
+
+    for person in people:
+        left, top, right, bottom = person["box"]
+        is_inside_person = (
+            left <= ppe_center_x <= right and top <= ppe_center_y <= bottom
+        )
+        if is_inside_person:
+            matching_people.append(person)
+
+    if not matching_people:
+        return None
+
+    # Jika ada kotak person yang tumpang tindih, pilih yang titik tengahnya paling dekat.
+    return min(
+        matching_people,
+        key=lambda person: sum(
+            (person_center - ppe_center) ** 2
+            for person_center, ppe_center in zip(
+                get_box_center(person["box"]),
+                (ppe_center_x, ppe_center_y),
+            )
+        ),
+    )
+
+
+def get_person_safety_status(person):
+    """Membuat status kelengkapan APD untuk satu person."""
+    missing_items = []
+    review_items = []
+
+    if person["no-helmet"]:
+        missing_items.append("helmet")
+    elif not person["helmet"]:
+        review_items.append("helmet tidak terdeteksi")
+
+    if person["no-vest"]:
+        missing_items.append("vest")
+    elif not person["vest"]:
+        review_items.append("vest tidak terdeteksi")
+
+    if missing_items:
+        return "Belum lengkap", f"Tidak memakai {', '.join(missing_items)}."
+    if review_items:
+        return "Perlu diperiksa", f"{'; '.join(review_items).capitalize()}."
+    return "Lengkap", "Helmet dan vest terdeteksi."
+
+
+def build_safety_analysis(detection_result):
+    """Menghitung objek dan membuat analisis kelengkapan APD per person."""
+    if detection_result.boxes is None:
+        return "### Analisis Objek\n\n- Tidak ada objek terdeteksi."
+
+    class_names = detection_result.names
+    boxes = detection_result.boxes.xyxy.cpu().numpy()
+    class_ids = detection_result.boxes.cls.cpu().numpy().astype(int)
+    counts = {}
+    people = []
+    ppe_items = []
+
+    # Pisahkan hasil deteksi menjadi person dan APD agar dapat dipasangkan.
+    for box, class_id in zip(boxes, class_ids):
+        class_name = class_names[class_id]
+        counts[class_name] = counts.get(class_name, 0) + 1
+        item = {"box": box, "label": class_name}
+
+        if class_name == "person":
+            people.append(
+                {
+                    "box": box,
+                    "helmet": [],
+                    "no-helmet": [],
+                    "vest": [],
+                    "no-vest": [],
+                }
+            )
+        elif class_name in PPE_LABELS:
+            ppe_items.append(item)
+
+    # Pasangkan APD ke person berdasarkan posisi tengah kotak APD.
+    for item in ppe_items:
+        matched_person = find_person_for_ppe(item["box"], people)
+        if matched_person is not None:
+            matched_person[item["label"]].append(item)
+
+    lines = ["### Analisis Objek", ""]
+    for class_name, count in sorted(counts.items()):
+        lines.append(f"- {class_name}: {count}")
+
+    if people:
+        lines.extend(["", "### Kelengkapan APD per Pekerja", ""])
+        complete_count = 0
+        incomplete_count = 0
+        review_count = 0
+
+        for index, person in enumerate(people, start=1):
+            status, detail = get_person_safety_status(person)
+            lines.append(f"- Pekerja {index}: **{status}** — {detail}")
+
+            if status == "Lengkap":
+                complete_count += 1
+            elif status == "Belum lengkap":
+                incomplete_count += 1
+            else:
+                review_count += 1
+
+        lines.extend(
+            [
+                "",
+                "### Simpulan",
+                "",
+                f"Terdeteksi **{len(people)} pekerja** pada gambar.",
+            ]
+        )
+
+        if complete_count:
+            lines.append(
+                f"- **{complete_count} pekerja** terlihat memakai helmet dan vest."
+            )
+        if incomplete_count:
+            lines.append(
+                f"- **{incomplete_count} pekerja** terlihat belum memakai APD dengan lengkap."
+            )
+        if review_count:
+            lines.append(
+                f"- **{review_count} pekerja** perlu diperiksa lagi karena APD-nya belum terdeteksi dengan jelas."
+            )
+
+        lines.extend(
+            [
+                "",
+                "Catatan: sistem memasangkan APD ke pekerja berdasarkan posisi kotak deteksi pada gambar.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "### Simpulan",
+                "",
+                "Tidak ada pekerja yang terdeteksi pada gambar.",
+            ]
+        )
+
+    return "\n".join(lines)
+
 
 def darken_outside_boxes(original_image, detection_result):
     """Membuat area di luar kotak deteksi terlihat lebih gelap."""
@@ -38,7 +196,9 @@ def darken_outside_boxes(original_image, detection_result):
 
     # Tandai isi setiap kotak deteksi dengan warna putih.
     if detection_result.boxes is not None:
-        for left, top, right, bottom in detection_result.boxes.xyxy.cpu().numpy().astype(int):
+        for left, top, right, bottom in (
+            detection_result.boxes.xyxy.cpu().numpy().astype(int)
+        ):
             cv2.rectangle(
                 detected_object_area,
                 (left, top),
@@ -69,8 +229,6 @@ def detect_image(image, image_size=640):
     display_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
     return Image.fromarray(display_image), detection_result
 
-    # return Image.fromarray(result_image), result
-
 
 def analyze_image(image, use_random_sample):
     """Menganalisis gambar upload atau contoh acak, lalu menampilkan ringkasannya."""
@@ -82,41 +240,9 @@ def analyze_image(image, use_random_sample):
             return None, "Silakan upload gambar terlebih dahulu."
         image = Image.open(random.choice(sample_images)).convert("RGB")
 
-    # Deteksi objek pada gambar, lalu hitung jumlah setiap kelas.
+    # Deteksi objek pada gambar, lalu buat analisis hasilnya.
     result_image, detection_result = detect_image(image)
-    class_names = detection_result.names # {0: 'helmet', 1: 'no-helmet', 2: 'no-vest', 3: 'person', 4: 'vest'}
-    counts = {}
-
-    # Jika tidak ada objek, bagian ini akan dilewati.
-    if detection_result.boxes is not None:
-        for box in detection_result.boxes:
-            class_id = int(box.cls.item())
-            class_name = class_names[class_id]
-            counts[class_name] = counts.get(class_name, 0) + 1
-
-    # Buat ringkasan singkat dari objek yang ditemukan.
-    if counts:
-        lines = ["### Analisis Objek", ""]
-        total_objects = sum(counts.values())
-        for class_name, count in sorted(counts.items()):
-            lines.append(f"- {class_name}: {count}")
-        lines.extend(
-            [
-                "",
-                "### Simpulan",
-                "",
-                f"Total objek terdeteksi: **{total_objects}**.",
-                "Hasil ini menunjukkan objek yang ditemukan pada gambar upload.",
-            ]
-        )
-        analysis = "\n".join(lines)
-    else:
-        analysis = (
-            "### Analisis Objek\n\n"
-            "- Tidak ada objek terdeteksi.\n\n"
-            "### Simpulan\n\n"
-            "Gambar tidak menunjukkan objek yang dikenali model."
-        )
+    analysis = build_safety_analysis(detection_result)
 
     return result_image, analysis
 
